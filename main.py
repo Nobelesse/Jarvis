@@ -21,7 +21,7 @@ def main():
     print("Speak a question. Say 'stop Jarvis' to close the program.")
 
     while True:
-        command = listen_for_text()
+        command = listen_for_text(seconds=8)
 
         if not command:
             continue
