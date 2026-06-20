@@ -1,0 +1,26 @@
+# Virtual environment
+.venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Secrets
+.env
+
+# Logs and local runtime data
+logs/*
+!logs/.gitkeep
+
+data/runtime/*
+!data/runtime/.gitkeep
+
+*.db
+*.sqlite
+*.sqlite3
+
+# VS Code / Windows
+.vscode/
+.vs/
+Thumbs.db
+Desktop.ini
