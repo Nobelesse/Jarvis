@@ -3,46 +3,53 @@ from core.speech_to_text import listen_for_text
 from core.text_to_speech import speak
 
 
-EXIT_COMMANDS = {
-    "exit",
-    "quit",
-    "shutdown jarvis",
+STOP_COMMANDS = {
+    "stop",
     "stop jarvis",
-    "goodbye jarvis",
+    "jarvis stop",
+    "exit",
+    "exit jarvis",
+    "jarvis exit",
+    "quit",
+    "quit jarvis",
+    "jarvis quit",
 }
 
 
-def is_exit_command(command):
-    return command.lower().strip() in EXIT_COMMANDS
+def should_stop_jarvis(text):
+    cleaned_text = str(text).lower().strip()
+    return cleaned_text in STOP_COMMANDS
 
 
 def main():
-    print("Jarvis Phase 2 is running.")
+    print("Jarvis Phase 3 is running.")
     print("Speak a question. Say 'stop Jarvis' to close the program.")
 
-    while True:
-        command = listen_for_text(seconds=8)
+    try:
+        while True:
+            user_text = listen_for_text()
 
-        if not command:
-            continue
+            if not user_text:
+                continue
 
-        command = command.strip()
+            print(f"\nYou: {user_text}")
 
-        print(f"You said: {command}")
+            if should_stop_jarvis(user_text):
+                goodbye_message = "Goodbye Boss. Jarvis is shutting down."
 
-        if is_exit_command(command):
-            goodbye_message = "Goodbye Boss. Jarvis is shutting down."
-            print(f"Jarvis: {goodbye_message}")
-            speak(goodbye_message)
-            break
+                print(f"Jarvis: {goodbye_message}")
+                speak(goodbye_message)
+                break
 
-        print("Jarvis is thinking...")
+            print("Jarvis: Thinking...")
 
-        response = get_ai_response(command)
+            response = get_ai_response(user_text)
 
-        print(f"Jarvis: {response}")
+            print(f"Jarvis: {response}\n")
+            speak(response)
 
-        speak(response)
+    except KeyboardInterrupt:
+        print("\nJarvis stopped from the keyboard.")
 
 
 if __name__ == "__main__":

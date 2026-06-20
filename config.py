@@ -23,7 +23,10 @@ MODELS_DIR.mkdir(parents=True, exist_ok=True)
 # Load secrets from .env
 # --------------------------------------------------
 
-load_dotenv(BASE_DIR / ".env")
+load_dotenv(
+    BASE_DIR / ".env",
+    override=True
+)
 
 
 # --------------------------------------------------
@@ -53,7 +56,7 @@ TTS_VOLUME = 1.0
 
 
 # --------------------------------------------------
-# Phase 2: OpenRouter AI settings
+# Phase 3: OpenRouter AI settings
 # --------------------------------------------------
 
 OPENROUTER_API_KEY = os.getenv(
@@ -69,3 +72,13 @@ OPENROUTER_MODEL = os.getenv(
 OPENROUTER_API_URL = (
     "https://openrouter.ai/api/v1/chat/completions"
 )
+
+OPENROUTER_TIMEOUT_SECONDS = 45
+
+
+# --------------------------------------------------
+# OpenRouter validation
+# --------------------------------------------------
+
+def openrouter_is_configured():
+    return bool(OPENROUTER_API_KEY)
