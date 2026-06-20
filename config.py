@@ -1,31 +1,22 @@
-import os
-from dataclasses import dataclass
 from pathlib import Path
-
-from dotenv import load_dotenv
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-ENV_FILE = PROJECT_ROOT / ".env"
 
-load_dotenv(ENV_FILE)
+CORE_DIR = PROJECT_ROOT / "core"
+DATA_DIR = PROJECT_ROOT / "data"
+MODELS_DIR = PROJECT_ROOT / "models"
+AUDIO_DIR = DATA_DIR / "audio"
 
+WAKE_WORD = "jarvis"
 
-@dataclass(frozen=True)
-class Settings:
-    app_name: str
-    environment: str
-    log_level: str
-    gemini_api_key: str | None
+SAMPLE_RATE = 16000
+CHANNELS = 1
 
+WAKE_WINDOW_SECONDS = 3.5
+COMMAND_WINDOW_SECONDS = 12.0
 
-def load_settings() -> Settings:
-    return Settings(
-        app_name="Jarvis",
-        environment=os.getenv("JARVIS_ENV", "development"),
-        log_level=os.getenv("JARVIS_LOG_LEVEL", "INFO"),
-        gemini_api_key=os.getenv("GEMINI_API_KEY") or None,
-    )
+WHISPER_MODEL = "base.en"
 
-
-settings = load_settings()
+TTS_RATE = 185
+TTS_VOLUME = 1.0

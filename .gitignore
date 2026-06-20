@@ -1,5 +1,6 @@
-# Virtual environment
+# Virtual environments
 .venv/
+venv/
 
 # Python cache
 __pycache__/
@@ -7,20 +8,15 @@ __pycache__/
 
 # Secrets
 .env
+.env.*
+!.env.example
 
-# Logs and local runtime data
-logs/*
-!logs/.gitkeep
+# Local models and temporary audio
+models/
+data/audio/
 
-data/runtime/*
-!data/runtime/.gitkeep
-
-*.db
-*.sqlite
-*.sqlite3
-
-# VS Code / Windows
+# IDE settings
 .vscode/
-.vs/
-Thumbs.db
-Desktop.ini
+
+# Logs
+*.log
