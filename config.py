@@ -20,7 +20,7 @@ MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # --------------------------------------------------
-# Load secret environment variables from .env
+# Load secrets from .env
 # --------------------------------------------------
 
 load_dotenv(BASE_DIR / ".env")
@@ -42,6 +42,14 @@ WHISPER_MODEL = os.getenv(
     "WHISPER_MODEL",
     "base"
 ).strip()
+
+
+# --------------------------------------------------
+# Phase 1: Text-to-speech settings
+# --------------------------------------------------
+
+TTS_RATE = 185
+TTS_VOLUME = 1.0
 
 
 # --------------------------------------------------
