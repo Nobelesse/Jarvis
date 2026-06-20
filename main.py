@@ -1,8 +1,19 @@
 # main.py
 
+from __future__ import annotations
+
+from automation.local_commands import handle_local_command
+from config import (
+    COMMAND_WINDOW_SECONDS,
+    VOICE_AUTH_ENABLED,
+)
 from core.ai_engine import get_ai_response, get_last_backend
 from core.speech_to_text import listen_for_text
 from core.text_to_speech import speak
+from core.voice_auth import (
+    has_voice_profile,
+    listen_for_verified_text,
+)
 from core.wake_word import wait_for_wake_word
 
 
@@ -62,9 +73,20 @@ def get_jarvis_response(question):
 
 
 def main():
-    print("Jarvis Phase 5 is running.")
+    print("Jarvis Phase 7 is running.")
     print("Say 'Jarvis' to activate me.")
     print("Say 'stop Jarvis' after activation to close the program.")
+
+    if VOICE_AUTH_ENABLED:
+        print("Voice profile verification: enabled")
+
+        if not has_voice_profile():
+            print("Voice profile not found.")
+            print("Run this once before using Jarvis:")
+            print("python enroll_voice.py")
+
+    else:
+        print("Voice profile verification: disabled")
 
     while True:
         try:
@@ -73,9 +95,36 @@ def main():
             if wake_result is False:
                 continue
 
+            if VOICE_AUTH_ENABLED and not has_voice_profile():
+                print(
+                    "[Access blocked: Enroll your voice profile before "
+                    "using Jarvis.]"
+                )
+                continue
+
             speak("Yes Boss, what can I do for you?")
 
-            question = clean_text(listen_for_text())
+            if VOICE_AUTH_ENABLED:
+                question, is_verified, score, verification_message = (
+                    listen_for_verified_text(COMMAND_WINDOW_SECONDS)
+                )
+
+                print(f"[Voice score: {score:.3f}]")
+                print(
+                    f"[Voice verification: "
+                    f"{verification_message}]"
+                )
+
+                if not is_verified:
+                    print(
+                        "[Command rejected. Returning to sleep mode.]"
+                    )
+                    continue
+
+            else:
+                question = listen_for_text()
+
+            question = clean_text(question)
 
             print(f"\nYou: {question}")
 
@@ -93,6 +142,16 @@ def main():
             if normalized_question in SLEEP_COMMANDS:
                 speak("Going back to sleep, Boss.")
                 print("Jarvis is back in sleep mode.")
+                continue
+
+            was_handled, local_response = handle_local_command(question)
+
+            if was_handled:
+                print(f"Jarvis: {local_response}\n")
+                speak(local_response)
+
+                print("Returning to sleep mode.")
+                print("Say 'Jarvis' to activate again.\n")
                 continue
 
             print("Jarvis is thinking...")
@@ -116,7 +175,10 @@ def main():
 
         except Exception as error:
             print(f"Jarvis Runtime Error: {error}")
-            speak("Sorry Boss, something went wrong. I am returning to sleep mode.")
+            speak(
+                "Sorry Boss, something went wrong. "
+                "I am returning to sleep mode."
+            )
 
 
 if __name__ == "__main__":
