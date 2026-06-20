@@ -4,17 +4,39 @@ import os
 from dotenv import load_dotenv
 
 
+# --------------------------------------------------
+# Base folders
+# --------------------------------------------------
+
 BASE_DIR = Path(__file__).resolve().parent
+
+DATA_DIR = BASE_DIR / "data"
+AUDIO_DIR = DATA_DIR / "audio"
+MODELS_DIR = BASE_DIR / "models"
+
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+MODELS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# --------------------------------------------------
+# Load secret environment variables from .env
+# --------------------------------------------------
 
 load_dotenv(BASE_DIR / ".env")
 
 
 # --------------------------------------------------
-# Phase 1: Offline speech-to-text settings
+# Phase 1: Audio recording settings
 # --------------------------------------------------
 
-MODELS_DIR = BASE_DIR / "models"
-MODELS_DIR.mkdir(parents=True, exist_ok=True)
+SAMPLE_RATE = 16000
+CHANNELS = 1
+
+
+# --------------------------------------------------
+# Phase 1: Offline speech-to-text settings
+# --------------------------------------------------
 
 WHISPER_MODEL = os.getenv(
     "WHISPER_MODEL",
@@ -23,7 +45,7 @@ WHISPER_MODEL = os.getenv(
 
 
 # --------------------------------------------------
-# Phase 2: OpenRouter online AI settings
+# Phase 2: OpenRouter AI settings
 # --------------------------------------------------
 
 OPENROUTER_API_KEY = os.getenv(
