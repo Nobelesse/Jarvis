@@ -1,22 +1,18 @@
 from pathlib import Path
+import os
+
+from dotenv import load_dotenv
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+BASE_DIR = Path(__file__).resolve().parent
 
-CORE_DIR = PROJECT_ROOT / "core"
-DATA_DIR = PROJECT_ROOT / "data"
-MODELS_DIR = PROJECT_ROOT / "models"
-AUDIO_DIR = DATA_DIR / "audio"
+load_dotenv(BASE_DIR / ".env")
 
-WAKE_WORD = "jarvis"
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
 
-SAMPLE_RATE = 16000
-CHANNELS = 1
+OPENROUTER_MODEL = os.getenv(
+    "OPENROUTER_MODEL",
+    "openrouter/free"
+).strip()
 
-WAKE_WINDOW_SECONDS = 3.5
-COMMAND_WINDOW_SECONDS = 12.0
-
-WHISPER_MODEL = "base.en"
-
-TTS_RATE = 185
-TTS_VOLUME = 1.0
+OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
