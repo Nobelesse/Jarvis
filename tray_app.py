@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ctypes
 import sys
+from typing import Any
 
 import pystray
 from PIL import Image, ImageDraw, ImageFont
@@ -64,7 +65,7 @@ def create_icon() -> Image.Image:
     return image
 
 
-def notify(icon: pystray.Icon, message: str) -> None:
+def notify(icon: Any, message: str) -> None:
     try:
         icon.notify(message, "Jarvis")
     except Exception:
@@ -72,47 +73,47 @@ def notify(icon: pystray.Icon, message: str) -> None:
 
 
 def start_jarvis_action(
-    icon: pystray.Icon,
-    item: pystray.MenuItem,
+    icon: Any,
+    _item: Any,
 ) -> None:
     _, message = start_jarvis_hidden()
     notify(icon, message)
 
 
 def stop_jarvis_action(
-    icon: pystray.Icon,
-    item: pystray.MenuItem,
+    icon: Any,
+    _item: Any,
 ) -> None:
     _, message = stop_jarvis()
     notify(icon, message)
 
 
 def restart_jarvis_action(
-    icon: pystray.Icon,
-    item: pystray.MenuItem,
+    icon: Any,
+    _item: Any,
 ) -> None:
     _, message = restart_jarvis()
     notify(icon, message)
 
 
 def status_action(
-    icon: pystray.Icon,
-    item: pystray.MenuItem,
+    icon: Any,
+    _item: Any,
 ) -> None:
     notify(icon, get_status_message())
 
 
 def close_tray_only(
-    icon: pystray.Icon,
-    item: pystray.MenuItem,
+    icon: Any,
+    _item: Any,
 ) -> None:
     notify(icon, "Tray controller closed. Jarvis keeps running.")
     icon.stop()
 
 
 def exit_everything(
-    icon: pystray.Icon,
-    item: pystray.MenuItem,
+    icon: Any,
+    _item: Any,
 ) -> None:
     stop_jarvis()
     icon.stop()
