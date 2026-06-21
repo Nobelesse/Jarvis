@@ -33,14 +33,13 @@ def main() -> None:
 
     if existing_samples:
         print(
-            f"\nAn existing voice profile with {len(existing_samples)} sample(s) "
-            "will be replaced."
+            f"\nYour existing profile has {len(existing_samples)} sample(s). "
+            "It will be replaced after successful enrollment."
         )
 
-    print(
-        "\nUse your normal speaking voice. Keep the microphone distance similar "
-        "to how you will use Jarvis every day."
-    )
+    print("\nUse your normal daily speaking voice.")
+    print("Keep the laptop microphone distance similar to normal Jarvis use.")
+    print("Choose a quiet room and avoid music, fan noise, or other voices.")
 
     captured_samples = []
 
@@ -53,7 +52,7 @@ def main() -> None:
             print(f"\nSample {sample_number} of {VOICE_AUTH_PROFILE_SAMPLES}")
             print(f'Say clearly: "{phrase}"')
 
-            input("Press Enter when you are ready to record...")
+            input("Press Enter when you are ready...")
 
             sample_path = record_voice_profile_sample(sample_number)
             captured_samples.append(sample_path)
@@ -66,13 +65,12 @@ def main() -> None:
 
         print("\nVoice profile enrolled successfully.")
         print(
-            f"Saved profile samples: "
-            f"{len(saved_profiles)} of {VOICE_AUTH_PROFILE_SAMPLES}"
+            f"Saved samples: {len(saved_profiles)} "
+            f"of {VOICE_AUTH_PROFILE_SAMPLES}"
         )
-        print("You can now start Jarvis normally.")
 
     except KeyboardInterrupt:
-        print("\nEnrollment cancelled. Your existing saved profile was not changed.")
+        print("\nEnrollment cancelled. Your existing profile was not changed.")
 
     except Exception as error:
         print(f"\nVoice enrollment failed: {error}")
