@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from automation.local_commands import handle_local_command
 from config import (
     COMMAND_WINDOW_SECONDS,
     VOICE_AUTH_ENABLED,
 )
+
+from automation.app_launcher import handle_app_command
 from core.ai_engine import get_ai_response, get_last_backend
 from core.speech_to_text import listen_for_text
 from core.text_to_speech import speak
@@ -34,14 +35,14 @@ SLEEP_COMMANDS = {
 }
 
 
-def clean_text(text):
+def clean_text(text) -> str:
     if text is None:
         return ""
 
     return str(text).strip()
 
 
-def create_jarvis_prompt(question):
+def create_jarvis_prompt(question: str) -> str:
     return f"""
 You are Jarvis, a helpful personal laptop voice assistant.
 
@@ -55,130 +56,157 @@ User question:
 """.strip()
 
 
-def get_jarvis_response(question):
+def get_jarvis_response(question: str) -> str:
     try:
         prompt = create_jarvis_prompt(question)
-        response = get_ai_response(prompt)
+        response = clean_text(get_ai_response(prompt))
 
-        response = clean_text(response)
+        backend = clean_text(get_last_backend())
 
-        if not response:
-            return "Sorry Boss, I could not generate a response."
+        if backend:
+            print(f"[AI backend: {backend}]")
 
-        return response
+        if response:
+            return response
+
+        return "I could not generate a response right now, Boss."
 
     except Exception as error:
-        print(f"AI Response Error: {error}")
-        return "Sorry Boss, I am having trouble connecting to my AI system."
+        print(f"Jarvis AI Error: {error}")
+        return "I ran into a problem while processing that, Boss."
 
 
-def main():
-    print("Jarvis Phase 7 is running.")
-    print("Say 'Jarvis' to activate me.")
-    print("Say 'stop Jarvis' after activation to close the program.")
+def unwrap_listener_result(result) -> str:
+    if isinstance(result, str):
+        return clean_text(result)
 
-    if VOICE_AUTH_ENABLED:
-        print("Voice profile verification: enabled")
+    if isinstance(result, (tuple, list)):
+        for item in result:
+            if isinstance(item, str) and item.strip():
+                return clean_text(item)
 
-        if not has_voice_profile():
-            print("Voice profile not found.")
-            print("Run this once before using Jarvis:")
-            print("python enroll_voice.py")
+    return ""
 
-    else:
-        print("Voice profile verification: disabled")
 
-    while True:
+def call_listener(listener) -> str:
+    attempts = [
+        lambda: listener(timeout=COMMAND_WINDOW_SECONDS),
+        lambda: listener(phrase_time_limit=COMMAND_WINDOW_SECONDS),
+        lambda: listener(COMMAND_WINDOW_SECONDS),
+        lambda: listener(),
+    ]
+
+    for attempt in attempts:
         try:
-            wake_result = wait_for_wake_word()
+            result = attempt()
+            return unwrap_listener_result(result)
 
-            if wake_result is False:
-                continue
-
-            if VOICE_AUTH_ENABLED and not has_voice_profile():
-                print(
-                    "[Access blocked: Enroll your voice profile before "
-                    "using Jarvis.]"
-                )
-                continue
-
-            speak("Yes Boss, what can I do for you?")
-
-            if VOICE_AUTH_ENABLED:
-                question, is_verified, score, verification_message = (
-                    listen_for_verified_text(COMMAND_WINDOW_SECONDS)
-                )
-
-                print(f"[Voice score: {score:.3f}]")
-                print(
-                    f"[Voice verification: "
-                    f"{verification_message}]"
-                )
-
-                if not is_verified:
-                    print(
-                        "[Command rejected. Returning to sleep mode.]"
-                    )
-                    continue
-
-            else:
-                question = listen_for_text()
-
-            question = clean_text(question)
-
-            print(f"\nYou: {question}")
-
-            if not question:
-                speak("I did not hear anything clearly, Boss.")
-                continue
-
-            normalized_question = question.lower()
-
-            if normalized_question in EXIT_COMMANDS:
-                speak("Goodbye Boss.")
-                print("Jarvis stopped.")
-                break
-
-            if normalized_question in SLEEP_COMMANDS:
-                speak("Going back to sleep, Boss.")
-                print("Jarvis is back in sleep mode.")
-                continue
-
-            was_handled, local_response = handle_local_command(question)
-
-            if was_handled:
-                print(f"Jarvis: {local_response}\n")
-                speak(local_response)
-
-                print("Returning to sleep mode.")
-                print("Say 'Jarvis' to activate again.\n")
-                continue
-
-            print("Jarvis is thinking...")
-
-            response = get_jarvis_response(question)
-            backend = clean_text(get_last_backend())
-
-            if backend:
-                print(f"AI Backend: {backend}")
-
-            print(f"Jarvis: {response}\n")
-
-            speak(response)
-
-            print("Returning to sleep mode.")
-            print("Say 'Jarvis' to activate again.\n")
-
-        except KeyboardInterrupt:
-            print("\nJarvis stopped from keyboard.")
-            break
+        except TypeError:
+            continue
 
         except Exception as error:
-            print(f"Jarvis Runtime Error: {error}")
-            speak(
-                "Sorry Boss, something went wrong. "
-                "I am returning to sleep mode."
+            print(f"Listening Error: {error}")
+            return ""
+
+    return ""
+
+
+def listen_for_verified_command() -> str:
+    try:
+        result = listen_for_verified_text(COMMAND_WINDOW_SECONDS)
+
+    except Exception as error:
+        print(f"Voice Authentication Error: {error}")
+        speak("I could not verify your voice, Boss.")
+        return ""
+
+    if not isinstance(result, tuple) or len(result) != 4:
+        print("[Access blocked: Voice authentication returned an invalid result.]")
+        speak("I could not verify your voice, Boss.")
+        return ""
+
+    command, is_verified, score, message = result
+
+    command = clean_text(command)
+    message = clean_text(message)
+
+    try:
+        score_value = float(score)
+    except (TypeError, ValueError):
+        score_value = 0.0
+
+    if not is_verified:
+        print(f"[Access blocked: {message}]")
+        print(f"[Voice score: {score_value:.3f}]")
+        speak("I could not verify your voice, Boss.")
+        return ""
+
+    print(f"[Voice verified: {message}]")
+    print(f"[Voice score: {score_value:.3f}]")
+
+    return command
+
+
+def listen_for_command() -> str:
+    if VOICE_AUTH_ENABLED:
+        try:
+            profile_exists = has_voice_profile()
+        except Exception as error:
+            print(f"Voice Profile Check Error: {error}")
+            profile_exists = False
+
+        if not profile_exists:
+            message = (
+                "Your voice profile is not enrolled. "
+                "Run python enroll_voice.py first."
             )
+            print(f"[Access blocked: {message}]")
+            speak(message)
+            return ""
+
+        return listen_for_verified_command()
+
+    return call_listener(listen_for_text)
+
+
+def main() -> None:
+    print("Jarvis Phase 8 is running.")
+    print("Say 'Jarvis' to activate me.")
+    print("Voice authentication remains enabled before commands are accepted.")
+
+    while True:
+        wait_for_wake_word()
+
+        speak("Hey Boss, what can I do for you?")
+
+        command = clean_text(listen_for_command())
+
+        if not command:
+            continue
+
+        print(f"You: {command}")
+
+        normalized_command = command.lower()
+
+        if normalized_command in EXIT_COMMANDS:
+            speak("Goodbye Boss.")
+            break
+
+        if normalized_command in SLEEP_COMMANDS:
+            speak("Going back to sleep, Boss.")
+            continue
+
+        app_response = handle_app_command(command)
+
+        if app_response:
+            print(f"Jarvis: {app_response}")
+            speak(app_response)
+            continue
+
+        response = get_jarvis_response(command)
+
+        print(f"Jarvis: {response}")
+        speak(response)
 
 
 if __name__ == "__main__":
