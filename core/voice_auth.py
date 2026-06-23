@@ -23,6 +23,9 @@ from config import (
 
 
 VOICE_VERIFICATION_SAMPLE_RATE = 16000
+VOICE_VERIFICATION_THRESHOLD = 0.25
+VOICE_ACTIVITY_PADDING_SECONDS = 0.25
+VOICE_MINIMUM_SPEECH_SECONDS = 1.0
 
 _voice_verifier: object | None = None
 _voice_verifier_lock = threading.Lock()
@@ -213,6 +216,82 @@ def _wav_to_float32(audio_data):
     return np.clip(audio, -1.0, 1.0)
 
 
+def _trim_silence(audio, sample_rate: int):
+    import numpy as np
+
+    if audio.size == 0:
+        raise ValueError("Audio file is empty.")
+
+    absolute_audio = np.abs(audio)
+    peak = float(absolute_audio.max())
+
+    if peak < 0.003:
+        raise ValueError(
+            "No usable speech was detected. Check your microphone input."
+        )
+
+    smoothing_window = max(
+        int(sample_rate * 0.02),
+        1,
+    )
+
+    smoothing_kernel = (
+        np.ones(smoothing_window, dtype=np.float32) / smoothing_window
+    )
+
+    smoothed_volume = np.convolve(
+        absolute_audio,
+        smoothing_kernel,
+        mode="same",
+    )
+
+    noise_floor = float(np.percentile(smoothed_volume, 20))
+
+    activity_threshold = max(
+        0.006,
+        min(
+            peak * 0.20,
+            max(noise_floor * 3.0, 0.008),
+        ),
+    )
+
+    active_indices = np.flatnonzero(
+        smoothed_volume >= activity_threshold
+    )
+
+    if active_indices.size == 0:
+        raise ValueError(
+            "No clear speech was detected. Speak closer to the microphone."
+        )
+
+    padding = int(
+        sample_rate * VOICE_ACTIVITY_PADDING_SECONDS
+    )
+
+    start_index = max(
+        int(active_indices[0]) - padding,
+        0,
+    )
+
+    end_index = min(
+        int(active_indices[-1]) + padding + 1,
+        len(audio),
+    )
+
+    trimmed_audio = audio[start_index:end_index]
+
+    minimum_samples = int(
+        sample_rate * VOICE_MINIMUM_SPEECH_SECONDS
+    )
+
+    if len(trimmed_audio) < minimum_samples:
+        raise ValueError(
+            "Too little speech was detected. Speak for at least two seconds."
+        )
+
+    return trimmed_audio
+
+
 def _load_wav_for_voice_verification(audio_path: str | Path):
     import numpy as np
     import torch
@@ -243,12 +322,12 @@ def _load_wav_for_voice_verification(audio_path: str | Path):
             int(sample_rate) // divisor,
         ).astype(np.float32)
 
-    minimum_samples = VOICE_VERIFICATION_SAMPLE_RATE // 2
+        sample_rate = VOICE_VERIFICATION_SAMPLE_RATE
 
-    if len(audio) < minimum_samples:
-        raise ValueError(
-            "Voice recording is too short. Please speak for at least one second."
-        )
+    audio = _trim_silence(
+        audio,
+        sample_rate,
+    )
 
     return torch.from_numpy(
         np.ascontiguousarray(audio),
@@ -262,12 +341,15 @@ def _compare_voice_files(
 ):
     import torch
 
-    profile_waveform = _load_wav_for_voice_verification(profile_file)
+    profile_waveform = _load_wav_for_voice_verification(
+        profile_file
+    )
 
     with torch.inference_mode():
         return verifier.verify_batch(
             profile_waveform,
             candidate_waveform,
+            threshold=VOICE_VERIFICATION_THRESHOLD,
         )
 
 
@@ -288,8 +370,9 @@ def verify_voice_recording(audio_path: str | Path) -> tuple[bool, float, str]:
 
     try:
         verifier = _get_voice_verifier()
+
         candidate_waveform = _load_wav_for_voice_verification(
-            candidate_path,
+            candidate_path
         )
 
     except Exception as error:
@@ -311,10 +394,18 @@ def verify_voice_recording(audio_path: str | Path) -> tuple[bool, float, str]:
                 candidate_waveform=candidate_waveform,
             )
 
-            scores.append(_score_to_float(score))
+            score_value = _score_to_float(score)
+            is_match = _prediction_is_match(prediction)
+
+            print(
+                f"[Voice comparison: {profile_file.name} | "
+                f"score={score_value:.3f} | match={is_match}]"
+            )
+
+            scores.append(score_value)
             successful_comparisons += 1
 
-            if _prediction_is_match(prediction):
+            if is_match:
                 matches += 1
 
         except Exception as error:
