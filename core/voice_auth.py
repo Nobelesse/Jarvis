@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
+import math
 import shutil
 import threading
 from pathlib import Path
 from uuid import uuid4
-from speechbrain.utils.fetching import LocalStrategy
 
 from config import (
     AUDIO_DIR,
@@ -21,6 +21,8 @@ from config import (
     WHISPER_MODEL,
 )
 
+
+VOICE_VERIFICATION_SAMPLE_RATE = 16000
 
 _voice_verifier: object | None = None
 _voice_verifier_lock = threading.Lock()
@@ -95,6 +97,7 @@ def _get_voice_verifier():
     with _voice_verifier_lock:
         if _voice_verifier is None:
             from speechbrain.inference.speaker import SpeakerRecognition
+            from speechbrain.utils.fetching import LocalStrategy
 
             print("[Loading offline voice-verification model...]")
 
@@ -174,6 +177,100 @@ def _score_to_float(score) -> float:
         return 0.0
 
 
+def _wav_to_float32(audio_data):
+    import numpy as np
+
+    audio = np.asarray(audio_data)
+
+    if audio.size == 0:
+        raise ValueError("Audio file is empty.")
+
+    if audio.ndim == 2:
+        audio = audio.mean(axis=1)
+    elif audio.ndim != 1:
+        audio = audio.reshape(-1)
+
+    if audio.dtype.kind == "u":
+        info = np.iinfo(audio.dtype)
+        midpoint = (float(info.max) + 1.0) / 2.0
+        audio = (audio.astype(np.float32) - midpoint) / midpoint
+
+    elif audio.dtype.kind == "i":
+        info = np.iinfo(audio.dtype)
+        divisor = float(max(abs(int(info.min)), abs(int(info.max))))
+        audio = audio.astype(np.float32) / divisor
+
+    else:
+        audio = audio.astype(np.float32)
+
+    audio = np.nan_to_num(
+        audio,
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+
+    return np.clip(audio, -1.0, 1.0)
+
+
+def _load_wav_for_voice_verification(audio_path: str | Path):
+    import numpy as np
+    import torch
+    from scipy.io import wavfile
+    from scipy.signal import resample_poly
+
+    path = Path(audio_path)
+
+    if not path.is_file():
+        raise FileNotFoundError(f"Audio file was not found: {path}")
+
+    sample_rate, audio_data = wavfile.read(str(path))
+
+    if sample_rate <= 0:
+        raise ValueError(f"Invalid sample rate in audio file: {path}")
+
+    audio = _wav_to_float32(audio_data)
+
+    if sample_rate != VOICE_VERIFICATION_SAMPLE_RATE:
+        divisor = math.gcd(
+            int(sample_rate),
+            VOICE_VERIFICATION_SAMPLE_RATE,
+        )
+
+        audio = resample_poly(
+            audio,
+            VOICE_VERIFICATION_SAMPLE_RATE // divisor,
+            int(sample_rate) // divisor,
+        ).astype(np.float32)
+
+    minimum_samples = VOICE_VERIFICATION_SAMPLE_RATE // 2
+
+    if len(audio) < minimum_samples:
+        raise ValueError(
+            "Voice recording is too short. Please speak for at least one second."
+        )
+
+    return torch.from_numpy(
+        np.ascontiguousarray(audio),
+    ).unsqueeze(0)
+
+
+def _compare_voice_files(
+    verifier,
+    profile_file: Path,
+    candidate_waveform,
+):
+    import torch
+
+    profile_waveform = _load_wav_for_voice_verification(profile_file)
+
+    with torch.inference_mode():
+        return verifier.verify_batch(
+            profile_waveform,
+            candidate_waveform,
+        )
+
+
 def verify_voice_recording(audio_path: str | Path) -> tuple[bool, float, str]:
     candidate_path = Path(audio_path)
 
@@ -191,11 +288,15 @@ def verify_voice_recording(audio_path: str | Path) -> tuple[bool, float, str]:
 
     try:
         verifier = _get_voice_verifier()
+        candidate_waveform = _load_wav_for_voice_verification(
+            candidate_path,
+        )
+
     except Exception as error:
         return (
             False,
             0.0,
-            f"Voice-verification model could not load: {error}",
+            f"Voice-verification setup could not start: {error}",
         )
 
     matches = 0
@@ -204,9 +305,10 @@ def verify_voice_recording(audio_path: str | Path) -> tuple[bool, float, str]:
 
     for profile_file in profile_files:
         try:
-            score, prediction = verifier.verify_files(
-                str(profile_file),
-                str(candidate_path),
+            score, prediction = _compare_voice_files(
+                verifier=verifier,
+                profile_file=profile_file,
+                candidate_waveform=candidate_waveform,
             )
 
             scores.append(_score_to_float(score))
@@ -216,7 +318,10 @@ def verify_voice_recording(audio_path: str | Path) -> tuple[bool, float, str]:
                 matches += 1
 
         except Exception as error:
-            print(f"[Voice comparison skipped: {error}]")
+            print(
+                "[Voice comparison skipped: "
+                f"{type(error).__name__}: {error}]"
+            )
 
     if successful_comparisons < VOICE_AUTH_REQUIRED_MATCHES:
         return (
