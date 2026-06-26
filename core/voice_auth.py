@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-import math
 import shutil
+import statistics
 import threading
+from itertools import combinations
 from pathlib import Path
 from uuid import uuid4
 
@@ -22,10 +23,16 @@ from config import (
 )
 
 
-VOICE_VERIFICATION_SAMPLE_RATE = 16000
+# SpeechBrain's default decision threshold for speaker verification.
 VOICE_VERIFICATION_THRESHOLD = 0.25
-VOICE_ACTIVITY_PADDING_SECONDS = 0.25
-VOICE_MINIMUM_SPEECH_SECONDS = 1.0
+
+# These validate recording quality. They do not lower security.
+VOICE_ENROLLMENT_MINIMUM_SPEECH_SECONDS = 1.80
+VOICE_COMMAND_MINIMUM_SPEECH_SECONDS = 0.70
+VOICE_MINIMUM_RMS = 0.004
+VOICE_MINIMUM_PEAK = 0.015
+VOICE_PROFILE_MINIMUM_MEDIAN_SCORE = 0.35
+VOICE_PROFILE_MINIMUM_MATCH_RATIO = 0.70
 
 _voice_verifier: object | None = None
 _voice_verifier_lock = threading.Lock()
@@ -67,19 +74,13 @@ def _record_wav(duration_seconds: float, prefix: str) -> Path:
         channels=1,
         dtype="float32",
     )
-
     sd.wait()
 
     audio_data = np.clip(recording, -1.0, 1.0)
     audio_data = (audio_data * 32767).astype(np.int16)
 
     audio_path = AUDIO_DIR / f"{prefix}_{uuid4().hex}.wav"
-
-    write(
-        str(audio_path),
-        SAMPLE_RATE,
-        audio_data,
-    )
+    write(str(audio_path), SAMPLE_RATE, audio_data)
 
     return audio_path
 
@@ -88,6 +89,17 @@ def record_voice_profile_sample(sample_number: int) -> Path:
     return _record_wav(
         duration_seconds=VOICE_AUTH_ENROLLMENT_SECONDS,
         prefix=f"voice_profile_sample_{sample_number}",
+    )
+
+
+def record_voice_verification_sample(
+    duration_seconds: float | None = None,
+) -> Path:
+    duration = duration_seconds or VOICE_AUTH_ENROLLMENT_SECONDS
+
+    return _record_wav(
+        duration_seconds=duration,
+        prefix="voice_auth_test",
     )
 
 
@@ -103,7 +115,6 @@ def _get_voice_verifier():
             from speechbrain.utils.fetching import LocalStrategy
 
             print("[Loading offline voice-verification model...]")
-
             VOICE_AUTH_MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
             _voice_verifier = SpeakerRecognition.from_hparams(
@@ -140,25 +151,6 @@ def _get_whisper_model():
             )
 
     return _whisper_model
-
-
-def _prediction_is_match(prediction) -> bool:
-    try:
-        value = prediction
-
-        if hasattr(value, "detach"):
-            value = value.detach().cpu()
-
-        if hasattr(value, "reshape"):
-            value = value.reshape(-1)[0]
-
-        if hasattr(value, "item"):
-            value = value.item()
-
-        return float(value) >= 0.5
-
-    except (TypeError, ValueError, IndexError):
-        return False
 
 
 def _score_to_float(score) -> float:
@@ -216,87 +208,9 @@ def _wav_to_float32(audio_data):
     return np.clip(audio, -1.0, 1.0)
 
 
-def _trim_silence(audio, sample_rate: int):
+def inspect_voice_recording(audio_path: str | Path) -> dict[str, float]:
     import numpy as np
-
-    if audio.size == 0:
-        raise ValueError("Audio file is empty.")
-
-    absolute_audio = np.abs(audio)
-    peak = float(absolute_audio.max())
-
-    if peak < 0.003:
-        raise ValueError(
-            "No usable speech was detected. Check your microphone input."
-        )
-
-    smoothing_window = max(
-        int(sample_rate * 0.02),
-        1,
-    )
-
-    smoothing_kernel = (
-        np.ones(smoothing_window, dtype=np.float32) / smoothing_window
-    )
-
-    smoothed_volume = np.convolve(
-        absolute_audio,
-        smoothing_kernel,
-        mode="same",
-    )
-
-    noise_floor = float(np.percentile(smoothed_volume, 20))
-
-    activity_threshold = max(
-        0.006,
-        min(
-            peak * 0.20,
-            max(noise_floor * 3.0, 0.008),
-        ),
-    )
-
-    active_indices = np.flatnonzero(
-        smoothed_volume >= activity_threshold
-    )
-
-    if active_indices.size == 0:
-        raise ValueError(
-            "No clear speech was detected. Speak closer to the microphone."
-        )
-
-    padding = int(
-        sample_rate * VOICE_ACTIVITY_PADDING_SECONDS
-    )
-
-    start_index = max(
-        int(active_indices[0]) - padding,
-        0,
-    )
-
-    end_index = min(
-        int(active_indices[-1]) + padding + 1,
-        len(audio),
-    )
-
-    trimmed_audio = audio[start_index:end_index]
-
-    minimum_samples = int(
-        sample_rate * VOICE_MINIMUM_SPEECH_SECONDS
-    )
-
-    if len(trimmed_audio) < minimum_samples:
-        raise ValueError(
-            "Too little speech was detected. Speak for at least two seconds."
-        )
-
-    return trimmed_audio
-
-
-def _load_wav_for_voice_verification(audio_path: str | Path):
-    import numpy as np
-    import torch
     from scipy.io import wavfile
-    from scipy.signal import resample_poly
 
     path = Path(audio_path)
 
@@ -310,47 +224,277 @@ def _load_wav_for_voice_verification(audio_path: str | Path):
 
     audio = _wav_to_float32(audio_data)
 
-    if sample_rate != VOICE_VERIFICATION_SAMPLE_RATE:
-        divisor = math.gcd(
-            int(sample_rate),
-            VOICE_VERIFICATION_SAMPLE_RATE,
+    absolute_audio = np.abs(audio)
+    peak = float(absolute_audio.max())
+    rms = float(np.sqrt(np.mean(np.square(audio))))
+
+    if peak <= 0.0:
+        activity_threshold = 0.0
+        active_ratio = 0.0
+        active_seconds = 0.0
+    else:
+        noise_floor = float(np.percentile(absolute_audio, 20))
+
+        activity_threshold = max(
+            0.006,
+            min(
+                0.050,
+                max(peak * 0.08, noise_floor * 3.0),
+            ),
         )
 
-        audio = resample_poly(
-            audio,
-            VOICE_VERIFICATION_SAMPLE_RATE // divisor,
-            int(sample_rate) // divisor,
-        ).astype(np.float32)
+        active_ratio = float(
+            np.mean(absolute_audio >= activity_threshold)
+        )
 
-        sample_rate = VOICE_VERIFICATION_SAMPLE_RATE
+        active_seconds = float(
+            audio.size * active_ratio / float(sample_rate)
+        )
 
-    audio = _trim_silence(
-        audio,
-        sample_rate,
+    return {
+        "duration_seconds": round(
+            audio.size / float(sample_rate),
+            3,
+        ),
+        "sample_rate": float(sample_rate),
+        "rms": rms,
+        "peak": peak,
+        "activity_threshold": activity_threshold,
+        "active_ratio": active_ratio,
+        "active_seconds": active_seconds,
+    }
+
+
+def get_voice_quality_issues(
+    audio_info: dict[str, float],
+    *,
+    minimum_speech_seconds: float,
+) -> list[str]:
+    issues: list[str] = []
+
+    if audio_info["peak"] < VOICE_MINIMUM_PEAK:
+        issues.append(
+            "Microphone input is too quiet. Speak closer to the microphone."
+        )
+
+    if audio_info["rms"] < VOICE_MINIMUM_RMS:
+        issues.append(
+            "The recording has very little voice energy."
+        )
+
+    if audio_info["active_seconds"] < minimum_speech_seconds:
+        issues.append(
+            f"Speak continuously for at least "
+            f"{minimum_speech_seconds:.1f} seconds."
+        )
+
+    return issues
+
+
+def format_voice_audio_quality(audio_info: dict[str, float]) -> str:
+    return (
+        "Audio quality: "
+        f"duration={audio_info['duration_seconds']:.1f}s, "
+        f"rms={audio_info['rms']:.3f}, "
+        f"peak={audio_info['peak']:.3f}, "
+        f"active={audio_info['active_ratio'] * 100:.0f}%"
     )
-
-    return torch.from_numpy(
-        np.ascontiguousarray(audio),
-    ).unsqueeze(0)
 
 
 def _compare_voice_files(
     verifier,
-    profile_file: Path,
-    candidate_waveform,
-):
-    import torch
-
-    profile_waveform = _load_wav_for_voice_verification(
-        profile_file
+    first_file: Path,
+    second_file: Path,
+) -> float:
+    score, _prediction = verifier.verify_files(
+        str(first_file),
+        str(second_file),
     )
 
-    with torch.inference_mode():
-        return verifier.verify_batch(
-            profile_waveform,
-            candidate_waveform,
-            threshold=VOICE_VERIFICATION_THRESHOLD,
+    return _score_to_float(score)
+
+
+def get_voice_profile_diagnostics(
+    sample_paths: list[str | Path] | None = None,
+) -> dict[str, object]:
+    if sample_paths is None:
+        samples = get_voice_profile_files()
+    else:
+        samples = [Path(path) for path in sample_paths]
+
+    report: dict[str, object] = {
+        "healthy": False,
+        "sample_count": len(samples),
+        "pairs": [],
+        "audio_issues": {},
+        "scores": [],
+        "median_score": 0.0,
+        "average_score": 0.0,
+        "match_ratio": 0.0,
+        "message": "",
+    }
+
+    if len(samples) < VOICE_AUTH_PROFILE_SAMPLES:
+        report["message"] = (
+            f"At least {VOICE_AUTH_PROFILE_SAMPLES} profile samples "
+            "are required."
         )
+        return report
+
+    for sample in samples:
+        if not sample.is_file():
+            report["message"] = (
+                f"Profile sample was not found: {sample.name}"
+            )
+            return report
+
+        try:
+            audio_info = inspect_voice_recording(sample)
+
+            issues = get_voice_quality_issues(
+                audio_info,
+                minimum_speech_seconds=VOICE_ENROLLMENT_MINIMUM_SPEECH_SECONDS,
+            )
+        except Exception as error:
+            report["message"] = (
+                f"Could not inspect {sample.name}: {error}"
+            )
+            return report
+
+        if issues:
+            audio_issues = report["audio_issues"]
+
+            if isinstance(audio_issues, dict):
+                audio_issues[sample.name] = issues
+
+    if report["audio_issues"]:
+        report["message"] = (
+            "One or more profile recordings have poor audio quality."
+        )
+        return report
+
+    try:
+        verifier = _get_voice_verifier()
+    except Exception as error:
+        report["message"] = (
+            f"Voice-verification model could not start: {error}"
+        )
+        return report
+
+    scores: list[float] = []
+    pairs: list[dict[str, object]] = []
+
+    for first_file, second_file in combinations(samples, 2):
+        try:
+            score = _compare_voice_files(
+                verifier,
+                first_file,
+                second_file,
+            )
+        except Exception as error:
+            report["message"] = (
+                f"Could not compare profile samples: {error}"
+            )
+            return report
+
+        is_match = score >= VOICE_VERIFICATION_THRESHOLD
+
+        scores.append(score)
+
+        pairs.append(
+            {
+                "first": first_file.name,
+                "second": second_file.name,
+                "score": score,
+                "match": is_match,
+            }
+        )
+
+    if not scores:
+        report["message"] = "No profile comparisons were created."
+        return report
+
+    match_ratio = sum(
+        score >= VOICE_VERIFICATION_THRESHOLD
+        for score in scores
+    ) / len(scores)
+
+    median_score = float(statistics.median(scores))
+    average_score = float(statistics.mean(scores))
+
+    healthy = (
+        median_score >= VOICE_PROFILE_MINIMUM_MEDIAN_SCORE
+        and match_ratio >= VOICE_PROFILE_MINIMUM_MATCH_RATIO
+    )
+
+    report.update(
+        {
+            "healthy": healthy,
+            "pairs": pairs,
+            "scores": scores,
+            "median_score": median_score,
+            "average_score": average_score,
+            "match_ratio": match_ratio,
+            "message": (
+                "Voice profile is calibrated and ready."
+                if healthy
+                else (
+                    "Profile recordings do not match reliably enough. "
+                    "Enroll again in a quiet room using the same microphone."
+                )
+            ),
+        }
+    )
+
+    return report
+
+
+def format_voice_profile_diagnostics(
+    report: dict[str, object],
+) -> str:
+    lines = [
+        "Voice profile diagnostics",
+        f"Samples: {report.get('sample_count', 0)}",
+    ]
+
+    message = str(report.get("message", "")).strip()
+
+    if message:
+        lines.append(f"Status: {message}")
+
+    audio_issues = report.get("audio_issues", {})
+
+    if isinstance(audio_issues, dict):
+        for file_name, issues in audio_issues.items():
+            joined_issues = "; ".join(str(item) for item in issues)
+            lines.append(f"{file_name}: {joined_issues}")
+
+    pairs = report.get("pairs", [])
+
+    if isinstance(pairs, list):
+        for pair in pairs:
+            if not isinstance(pair, dict):
+                continue
+
+            first = pair.get("first", "unknown")
+            second = pair.get("second", "unknown")
+            score = float(pair.get("score", 0.0))
+            match = bool(pair.get("match", False))
+
+            lines.append(
+                f"{first} vs {second}: "
+                f"score={score:.3f}, match={match}"
+            )
+
+    if report.get("scores"):
+        lines.append(
+            "Summary: "
+            f"median={float(report.get('median_score', 0.0)):.3f}, "
+            f"average={float(report.get('average_score', 0.0)):.3f}, "
+            f"matches={float(report.get('match_ratio', 0.0)) * 100:.0f}%"
+        )
+
+    return "\n".join(lines)
 
 
 def verify_voice_recording(audio_path: str | Path) -> tuple[bool, float, str]:
@@ -369,12 +513,29 @@ def verify_voice_recording(audio_path: str | Path) -> tuple[bool, float, str]:
         )
 
     try:
-        verifier = _get_voice_verifier()
+        candidate_info = inspect_voice_recording(candidate_path)
 
-        candidate_waveform = _load_wav_for_voice_verification(
-            candidate_path
+        candidate_issues = get_voice_quality_issues(
+            candidate_info,
+            minimum_speech_seconds=VOICE_COMMAND_MINIMUM_SPEECH_SECONDS,
+        )
+    except Exception as error:
+        return (
+            False,
+            0.0,
+            f"Could not inspect voice recording: {error}",
         )
 
+    if candidate_issues:
+        return (
+            False,
+            0.0,
+            "Voice check needs a clearer recording. "
+            + " ".join(candidate_issues),
+        )
+
+    try:
+        verifier = _get_voice_verifier()
     except Exception as error:
         return (
             False,
@@ -382,58 +543,64 @@ def verify_voice_recording(audio_path: str | Path) -> tuple[bool, float, str]:
             f"Voice-verification setup could not start: {error}",
         )
 
-    matches = 0
     scores: list[float] = []
-    successful_comparisons = 0
 
     for profile_file in profile_files:
         try:
-            score, prediction = _compare_voice_files(
-                verifier=verifier,
-                profile_file=profile_file,
-                candidate_waveform=candidate_waveform,
+            score = _compare_voice_files(
+                verifier,
+                profile_file,
+                candidate_path,
             )
-
-            score_value = _score_to_float(score)
-            is_match = _prediction_is_match(prediction)
-
-            print(
-                f"[Voice comparison: {profile_file.name} | "
-                f"score={score_value:.3f} | match={is_match}]"
-            )
-
-            scores.append(score_value)
-            successful_comparisons += 1
-
-            if is_match:
-                matches += 1
-
         except Exception as error:
             print(
                 "[Voice comparison skipped: "
                 f"{type(error).__name__}: {error}]"
             )
+            continue
 
-    if successful_comparisons < VOICE_AUTH_REQUIRED_MATCHES:
+        is_match = score >= VOICE_VERIFICATION_THRESHOLD
+
+        print(
+            f"[Voice comparison: {profile_file.name} | "
+            f"score={score:.3f} | match={is_match}]"
+        )
+
+        scores.append(score)
+
+    if len(scores) < VOICE_AUTH_REQUIRED_MATCHES:
         return (
             False,
             0.0,
             "Not enough valid voice comparisons were available.",
         )
 
-    average_score = sum(scores) / len(scores) if scores else 0.0
+    best_scores = sorted(scores, reverse=True)[
+        :VOICE_AUTH_REQUIRED_MATCHES
+    ]
 
-    if matches >= VOICE_AUTH_REQUIRED_MATCHES:
+    decision_score = float(statistics.mean(best_scores))
+
+    matches = sum(
+        score >= VOICE_VERIFICATION_THRESHOLD
+        for score in scores
+    )
+
+    if (
+        matches >= VOICE_AUTH_REQUIRED_MATCHES
+        and decision_score >= VOICE_VERIFICATION_THRESHOLD
+    ):
         return (
             True,
-            average_score,
+            decision_score,
             f"Voice verified with {matches} matching profile samples.",
         )
 
     return (
         False,
-        average_score,
-        f"Voice verification failed. Only {matches} profile samples matched.",
+        decision_score,
+        f"Voice verification failed. "
+        f"Only {matches} profile samples matched.",
     )
 
 
@@ -535,10 +702,7 @@ def replace_voice_profile(sample_paths: list[str | Path]) -> None:
         ):
             destination = staging_dir / f"profile_{index:02d}.wav"
 
-            shutil.copy2(
-                sample_path,
-                destination,
-            )
+            shutil.copy2(sample_path, destination)
 
         if VOICE_AUTH_PROFILE_DIR.exists():
             shutil.rmtree(VOICE_AUTH_PROFILE_DIR)
