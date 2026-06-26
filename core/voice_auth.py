@@ -2,146 +2,252 @@
 
 from __future__ import annotations
 
-import shutil
-import statistics
+import itertools
+import json
+import re
+import secrets
 import threading
-from itertools import combinations
+import time
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from uuid import uuid4
 
-from config import (
-    AUDIO_DIR,
-    MODELS_DIR,
-    SAMPLE_RATE,
-    VOICE_AUTH_ENROLLMENT_SECONDS,
-    VOICE_AUTH_MODEL_DIR,
-    VOICE_AUTH_MODEL_SOURCE,
-    VOICE_AUTH_PROFILE_DIR,
-    VOICE_AUTH_PROFILE_SAMPLES,
-    VOICE_AUTH_REQUIRED_MATCHES,
-    WHISPER_MODEL,
+import numpy as np
+import sounddevice as sd
+import soundfile as sf
+import torch
+import torch.nn.functional as F
+import torchaudio
+import config
+from faster_whisper import WhisperModel
+
+
+AUDIO_DIR = Path(config.AUDIO_DIR)
+MODELS_DIR = Path(config.MODELS_DIR)
+SAMPLE_RATE = int(config.SAMPLE_RATE)
+WHISPER_MODEL = str(config.WHISPER_MODEL)
+
+VOICE_AUTH_PROFILE_DIR = Path(config.VOICE_AUTH_PROFILE_DIR)
+VOICE_AUTH_MODEL_DIR = Path(config.VOICE_AUTH_MODEL_DIR)
+VOICE_AUTH_MODEL_SOURCE = str(config.VOICE_AUTH_MODEL_SOURCE)
+VOICE_AUTH_PROFILE_SAMPLES = max(3, int(config.VOICE_AUTH_PROFILE_SAMPLES))
+VOICE_AUTH_REQUIRED_MATCHES = max(1, int(config.VOICE_AUTH_REQUIRED_MATCHES))
+VOICE_AUTH_ENROLLMENT_SECONDS = max(
+    3.0,
+    float(config.VOICE_AUTH_ENROLLMENT_SECONDS),
+)
+
+VOICE_AUTH_ENABLED = bool(getattr(config, "VOICE_AUTH_ENABLED", True))
+VOICE_AUTH_SCORE_THRESHOLD = max(
+    0.25,
+    float(getattr(config, "VOICE_AUTH_SCORE_THRESHOLD", 0.32)),
+)
+VOICE_AUTH_LIVENESS_SECONDS = max(
+    4.5,
+    float(getattr(config, "VOICE_AUTH_LIVENESS_SECONDS", 6.5)),
+)
+VOICE_AUTH_KEEP_DIAGNOSTIC_AUDIO = bool(
+    getattr(config, "VOICE_AUTH_KEEP_DIAGNOSTIC_AUDIO", False)
+)
+
+AUTH_AUDIO_DIR = AUDIO_DIR / "voice_auth"
+CALIBRATION_PATH = VOICE_AUTH_PROFILE_DIR / "voice_auth_calibration.json"
+
+MIN_RMS = 0.006
+MIN_ACTIVE_SECONDS = 0.70
+MAX_PEAK = 0.995
+SILENCE_TRIM_PADDING_SECONDS = 0.15
+
+CHALLENGE_ADJECTIVES = (
+    "amber",
+    "copper",
+    "crimson",
+    "gentle",
+    "golden",
+    "lunar",
+    "quiet",
+    "silver",
+    "violet",
+    "winter",
+)
+
+CHALLENGE_PLACES = (
+    "canyon",
+    "forest",
+    "garden",
+    "harbor",
+    "river",
+    "valley",
+    "village",
+)
+
+CHALLENGE_OBJECTS = (
+    "comet",
+    "falcon",
+    "lantern",
+    "marble",
+    "thunder",
 )
 
 
-# SpeechBrain's default decision threshold for speaker verification.
-VOICE_VERIFICATION_THRESHOLD = 0.25
-
-# These validate recording quality. They do not lower security.
-VOICE_ENROLLMENT_MINIMUM_SPEECH_SECONDS = 1.80
-VOICE_COMMAND_MINIMUM_SPEECH_SECONDS = 0.70
-VOICE_MINIMUM_RMS = 0.004
-VOICE_MINIMUM_PEAK = 0.015
-VOICE_PROFILE_MINIMUM_MEDIAN_SCORE = 0.35
-VOICE_PROFILE_MINIMUM_MATCH_RATIO = 0.70
-
-_voice_verifier: object | None = None
-_voice_verifier_lock = threading.Lock()
-
-_whisper_model: object | None = None
+_speaker_verifier: object | None = None
+_whisper_model: WhisperModel | None = None
+_speaker_verifier_lock = threading.Lock()
 _whisper_model_lock = threading.Lock()
 
 
-def get_voice_profile_files() -> list[Path]:
-    if not VOICE_AUTH_PROFILE_DIR.exists():
-        return []
+class VoiceAuthError(RuntimeError):
+    """Raised when Jarvis cannot securely complete voice authentication."""
 
-    return sorted(
-        file_path
-        for file_path in VOICE_AUTH_PROFILE_DIR.glob("profile_*.wav")
-        if file_path.is_file()
-    )
+
+@dataclass(frozen=True)
+class AudioQuality:
+    duration_seconds: float
+    rms: float
+    peak: float
+    active_seconds: float
+    active_ratio: float
+    clipped: bool
+    passed: bool
+    reason: str
+
+
+@dataclass(frozen=True)
+class SpeakerVerificationResult:
+    passed: bool
+    best_score: float
+    matching_samples: int
+    required_matches: int
+    threshold: float
+    scores: tuple[float, ...]
+    reason: str
+
+
+@dataclass(frozen=True)
+class VoiceLivenessResult:
+    passed: bool
+    challenge_phrase: str
+    transcript: str
+    quality: AudioQuality | None
+    speaker: SpeakerVerificationResult | None
+    reason: str
+
+
+def _profile_files() -> list[Path]:
+    return sorted(VOICE_AUTH_PROFILE_DIR.glob("profile_*.wav"))
 
 
 def has_voice_profile() -> bool:
-    return len(get_voice_profile_files()) >= VOICE_AUTH_PROFILE_SAMPLES
+    return len(_profile_files()) >= VOICE_AUTH_PROFILE_SAMPLES
 
 
-def _record_wav(duration_seconds: float, prefix: str) -> Path:
-    import numpy as np
-    import sounddevice as sd
-    from scipy.io.wavfile import write
+def _normalise_text(value: str) -> str:
+    text = re.sub(r"[^a-z0-9\s]", " ", str(value).lower())
+    return re.sub(r"\s+", " ", text).strip()
 
-    if duration_seconds <= 0:
-        raise ValueError("Recording duration must be greater than zero.")
 
-    AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+def _random_challenge_phrase() -> str:
+    random_source = secrets.SystemRandom()
 
-    print(f"[Listening for {duration_seconds:.1f} seconds...]")
+    return " ".join(
+        (
+            random_source.choice(CHALLENGE_ADJECTIVES),
+            random_source.choice(CHALLENGE_PLACES),
+            random_source.choice(CHALLENGE_OBJECTS),
+        )
+    )
 
-    recording = sd.rec(
-        int(duration_seconds * SAMPLE_RATE),
-        samplerate=SAMPLE_RATE,
-        channels=1,
+
+def _record_wav(destination: Path, seconds: float) -> Path:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        print(f"[Listening for {seconds:.1f} seconds...]")
+
+        recording = sd.rec(
+            int(SAMPLE_RATE * seconds),
+            samplerate=SAMPLE_RATE,
+            channels=1,
+            dtype="float32",
+        )
+        sd.wait()
+
+        sf.write(
+            str(destination),
+            recording,
+            SAMPLE_RATE,
+            subtype="PCM_16",
+        )
+    except Exception as exc:
+        raise VoiceAuthError(f"Microphone recording failed: {exc}") from exc
+
+    return destination
+
+
+def _analyse_audio(audio_path: Path) -> AudioQuality:
+    samples, sample_rate = sf.read(
+        str(audio_path),
         dtype="float32",
+        always_2d=True,
     )
-    sd.wait()
+    mono = np.mean(samples, axis=1)
 
-    audio_data = np.clip(recording, -1.0, 1.0)
-    audio_data = (audio_data * 32767).astype(np.int16)
+    if len(mono) == 0:
+        return AudioQuality(0.0, 0.0, 0.0, 0.0, 0.0, False, False, "Empty audio.")
 
-    audio_path = AUDIO_DIR / f"{prefix}_{uuid4().hex}.wav"
-    write(str(audio_path), SAMPLE_RATE, audio_data)
+    duration_seconds = len(mono) / float(sample_rate)
+    rms = float(np.sqrt(np.mean(np.square(mono))))
+    peak = float(np.max(np.abs(mono)))
 
-    return audio_path
+    frame_length = max(1, int(sample_rate * 0.03))
+    usable_length = (len(mono) // frame_length) * frame_length
 
+    if usable_length == 0:
+        return AudioQuality(
+            duration_seconds,
+            rms,
+            peak,
+            0.0,
+            0.0,
+            False,
+            False,
+            "Audio was too short.",
+        )
 
-def record_voice_profile_sample(sample_number: int) -> Path:
-    return _record_wav(
-        duration_seconds=VOICE_AUTH_ENROLLMENT_SECONDS,
-        prefix=f"voice_profile_sample_{sample_number}",
+    frames = mono[:usable_length].reshape(-1, frame_length)
+    frame_rms = np.sqrt(np.mean(np.square(frames), axis=1))
+    activity_floor = max(MIN_RMS, rms * 0.35)
+    active_ratio = float(np.mean(frame_rms >= activity_floor))
+    active_seconds = active_ratio * duration_seconds
+    clipped = peak >= MAX_PEAK
+
+    if rms < MIN_RMS:
+        reason = "Voice was too quiet."
+    elif active_seconds < MIN_ACTIVE_SECONDS:
+        reason = "Not enough clear speech was detected."
+    elif clipped:
+        reason = "Audio was clipped. Move slightly away from the microphone."
+    else:
+        reason = "Audio quality passed."
+
+    return AudioQuality(
+        duration_seconds=duration_seconds,
+        rms=rms,
+        peak=peak,
+        active_seconds=active_seconds,
+        active_ratio=active_ratio,
+        clipped=clipped,
+        passed=reason == "Audio quality passed.",
+        reason=reason,
     )
 
 
-def record_voice_verification_sample(
-    duration_seconds: float | None = None,
-) -> Path:
-    duration = duration_seconds or VOICE_AUTH_ENROLLMENT_SECONDS
-
-    return _record_wav(
-        duration_seconds=duration,
-        prefix="voice_auth_test",
-    )
-
-
-def _get_voice_verifier():
-    global _voice_verifier
-
-    if _voice_verifier is not None:
-        return _voice_verifier
-
-    with _voice_verifier_lock:
-        if _voice_verifier is None:
-            from speechbrain.inference.speaker import SpeakerRecognition
-            from speechbrain.utils.fetching import LocalStrategy
-
-            print("[Loading offline voice-verification model...]")
-            VOICE_AUTH_MODEL_DIR.mkdir(parents=True, exist_ok=True)
-
-            _voice_verifier = SpeakerRecognition.from_hparams(
-                source=VOICE_AUTH_MODEL_SOURCE,
-                savedir=str(VOICE_AUTH_MODEL_DIR),
-                run_opts={"device": "cpu"},
-                local_strategy=LocalStrategy.COPY,
-            )
-
-    return _voice_verifier
-
-
-def warm_up_voice_verifier() -> None:
-    _get_voice_verifier()
-
-
-def _get_whisper_model():
+def _get_whisper_model() -> WhisperModel:
     global _whisper_model
-
-    if _whisper_model is not None:
-        return _whisper_model
 
     with _whisper_model_lock:
         if _whisper_model is None:
-            from faster_whisper import WhisperModel
-
-            print("[Loading local speech-recognition model...]")
+            print("[Loading offline speech-recognition model for liveness...]")
 
             _whisper_model = WhisperModel(
                 WHISPER_MODEL,
@@ -153,574 +259,410 @@ def _get_whisper_model():
     return _whisper_model
 
 
-def _score_to_float(score) -> float:
-    try:
-        value = score
-
-        if hasattr(value, "detach"):
-            value = value.detach().cpu()
-
-        if hasattr(value, "reshape"):
-            value = value.reshape(-1)[0]
-
-        if hasattr(value, "item"):
-            value = value.item()
-
-        return float(value)
-
-    except (TypeError, ValueError, IndexError):
-        return 0.0
-
-
-def _wav_to_float32(audio_data):
-    import numpy as np
-
-    audio = np.asarray(audio_data)
-
-    if audio.size == 0:
-        raise ValueError("Audio file is empty.")
-
-    if audio.ndim == 2:
-        audio = audio.mean(axis=1)
-    elif audio.ndim != 1:
-        audio = audio.reshape(-1)
-
-    if audio.dtype.kind == "u":
-        info = np.iinfo(audio.dtype)
-        midpoint = (float(info.max) + 1.0) / 2.0
-        audio = (audio.astype(np.float32) - midpoint) / midpoint
-
-    elif audio.dtype.kind == "i":
-        info = np.iinfo(audio.dtype)
-        divisor = float(max(abs(int(info.min)), abs(int(info.max))))
-        audio = audio.astype(np.float32) / divisor
-
-    else:
-        audio = audio.astype(np.float32)
-
-    audio = np.nan_to_num(
-        audio,
-        nan=0.0,
-        posinf=0.0,
-        neginf=0.0,
-    )
-
-    return np.clip(audio, -1.0, 1.0)
-
-
-def inspect_voice_recording(audio_path: str | Path) -> dict[str, float]:
-    import numpy as np
-    from scipy.io import wavfile
-
-    path = Path(audio_path)
-
-    if not path.is_file():
-        raise FileNotFoundError(f"Audio file was not found: {path}")
-
-    sample_rate, audio_data = wavfile.read(str(path))
-
-    if sample_rate <= 0:
-        raise ValueError(f"Invalid sample rate in audio file: {path}")
-
-    audio = _wav_to_float32(audio_data)
-
-    absolute_audio = np.abs(audio)
-    peak = float(absolute_audio.max())
-    rms = float(np.sqrt(np.mean(np.square(audio))))
-
-    if peak <= 0.0:
-        activity_threshold = 0.0
-        active_ratio = 0.0
-        active_seconds = 0.0
-    else:
-        noise_floor = float(np.percentile(absolute_audio, 20))
-
-        activity_threshold = max(
-            0.006,
-            min(
-                0.050,
-                max(peak * 0.08, noise_floor * 3.0),
-            ),
-        )
-
-        active_ratio = float(
-            np.mean(absolute_audio >= activity_threshold)
-        )
-
-        active_seconds = float(
-            audio.size * active_ratio / float(sample_rate)
-        )
-
-    return {
-        "duration_seconds": round(
-            audio.size / float(sample_rate),
-            3,
-        ),
-        "sample_rate": float(sample_rate),
-        "rms": rms,
-        "peak": peak,
-        "activity_threshold": activity_threshold,
-        "active_ratio": active_ratio,
-        "active_seconds": active_seconds,
-    }
-
-
-def get_voice_quality_issues(
-    audio_info: dict[str, float],
-    *,
-    minimum_speech_seconds: float,
-) -> list[str]:
-    issues: list[str] = []
-
-    if audio_info["peak"] < VOICE_MINIMUM_PEAK:
-        issues.append(
-            "Microphone input is too quiet. Speak closer to the microphone."
-        )
-
-    if audio_info["rms"] < VOICE_MINIMUM_RMS:
-        issues.append(
-            "The recording has very little voice energy."
-        )
-
-    if audio_info["active_seconds"] < minimum_speech_seconds:
-        issues.append(
-            f"Speak continuously for at least "
-            f"{minimum_speech_seconds:.1f} seconds."
-        )
-
-    return issues
-
-
-def format_voice_audio_quality(audio_info: dict[str, float]) -> str:
-    return (
-        "Audio quality: "
-        f"duration={audio_info['duration_seconds']:.1f}s, "
-        f"rms={audio_info['rms']:.3f}, "
-        f"peak={audio_info['peak']:.3f}, "
-        f"active={audio_info['active_ratio'] * 100:.0f}%"
-    )
-
-
-def _compare_voice_files(
-    verifier,
-    first_file: Path,
-    second_file: Path,
-) -> float:
-    score, _prediction = verifier.verify_files(
-        str(first_file),
-        str(second_file),
-    )
-
-    return _score_to_float(score)
-
-
-def get_voice_profile_diagnostics(
-    sample_paths: list[str | Path] | None = None,
-) -> dict[str, object]:
-    if sample_paths is None:
-        samples = get_voice_profile_files()
-    else:
-        samples = [Path(path) for path in sample_paths]
-
-    report: dict[str, object] = {
-        "healthy": False,
-        "sample_count": len(samples),
-        "pairs": [],
-        "audio_issues": {},
-        "scores": [],
-        "median_score": 0.0,
-        "average_score": 0.0,
-        "match_ratio": 0.0,
-        "message": "",
-    }
-
-    if len(samples) < VOICE_AUTH_PROFILE_SAMPLES:
-        report["message"] = (
-            f"At least {VOICE_AUTH_PROFILE_SAMPLES} profile samples "
-            "are required."
-        )
-        return report
-
-    for sample in samples:
-        if not sample.is_file():
-            report["message"] = (
-                f"Profile sample was not found: {sample.name}"
-            )
-            return report
-
-        try:
-            audio_info = inspect_voice_recording(sample)
-
-            issues = get_voice_quality_issues(
-                audio_info,
-                minimum_speech_seconds=VOICE_ENROLLMENT_MINIMUM_SPEECH_SECONDS,
-            )
-        except Exception as error:
-            report["message"] = (
-                f"Could not inspect {sample.name}: {error}"
-            )
-            return report
-
-        if issues:
-            audio_issues = report["audio_issues"]
-
-            if isinstance(audio_issues, dict):
-                audio_issues[sample.name] = issues
-
-    if report["audio_issues"]:
-        report["message"] = (
-            "One or more profile recordings have poor audio quality."
-        )
-        return report
+def _transcribe_audio(audio_path: Path) -> str:
+    model = _get_whisper_model()
 
     try:
-        verifier = _get_voice_verifier()
-    except Exception as error:
-        report["message"] = (
-            f"Voice-verification model could not start: {error}"
-        )
-        return report
-
-    scores: list[float] = []
-    pairs: list[dict[str, object]] = []
-
-    for first_file, second_file in combinations(samples, 2):
-        try:
-            score = _compare_voice_files(
-                verifier,
-                first_file,
-                second_file,
-            )
-        except Exception as error:
-            report["message"] = (
-                f"Could not compare profile samples: {error}"
-            )
-            return report
-
-        is_match = score >= VOICE_VERIFICATION_THRESHOLD
-
-        scores.append(score)
-
-        pairs.append(
-            {
-                "first": first_file.name,
-                "second": second_file.name,
-                "score": score,
-                "match": is_match,
-            }
-        )
-
-    if not scores:
-        report["message"] = "No profile comparisons were created."
-        return report
-
-    match_ratio = sum(
-        score >= VOICE_VERIFICATION_THRESHOLD
-        for score in scores
-    ) / len(scores)
-
-    median_score = float(statistics.median(scores))
-    average_score = float(statistics.mean(scores))
-
-    healthy = (
-        median_score >= VOICE_PROFILE_MINIMUM_MEDIAN_SCORE
-        and match_ratio >= VOICE_PROFILE_MINIMUM_MATCH_RATIO
-    )
-
-    report.update(
-        {
-            "healthy": healthy,
-            "pairs": pairs,
-            "scores": scores,
-            "median_score": median_score,
-            "average_score": average_score,
-            "match_ratio": match_ratio,
-            "message": (
-                "Voice profile is calibrated and ready."
-                if healthy
-                else (
-                    "Profile recordings do not match reliably enough. "
-                    "Enroll again in a quiet room using the same microphone."
-                )
-            ),
-        }
-    )
-
-    return report
-
-
-def format_voice_profile_diagnostics(
-    report: dict[str, object],
-) -> str:
-    lines = [
-        "Voice profile diagnostics",
-        f"Samples: {report.get('sample_count', 0)}",
-    ]
-
-    message = str(report.get("message", "")).strip()
-
-    if message:
-        lines.append(f"Status: {message}")
-
-    audio_issues = report.get("audio_issues", {})
-
-    if isinstance(audio_issues, dict):
-        for file_name, issues in audio_issues.items():
-            joined_issues = "; ".join(str(item) for item in issues)
-            lines.append(f"{file_name}: {joined_issues}")
-
-    pairs = report.get("pairs", [])
-
-    if isinstance(pairs, list):
-        for pair in pairs:
-            if not isinstance(pair, dict):
-                continue
-
-            first = pair.get("first", "unknown")
-            second = pair.get("second", "unknown")
-            score = float(pair.get("score", 0.0))
-            match = bool(pair.get("match", False))
-
-            lines.append(
-                f"{first} vs {second}: "
-                f"score={score:.3f}, match={match}"
-            )
-
-    if report.get("scores"):
-        lines.append(
-            "Summary: "
-            f"median={float(report.get('median_score', 0.0)):.3f}, "
-            f"average={float(report.get('average_score', 0.0)):.3f}, "
-            f"matches={float(report.get('match_ratio', 0.0)) * 100:.0f}%"
-        )
-
-    return "\n".join(lines)
-
-
-def verify_voice_recording(audio_path: str | Path) -> tuple[bool, float, str]:
-    candidate_path = Path(audio_path)
-
-    if not candidate_path.is_file():
-        return False, 0.0, "Voice recording was not found."
-
-    profile_files = get_voice_profile_files()
-
-    if len(profile_files) < VOICE_AUTH_PROFILE_SAMPLES:
-        return (
-            False,
-            0.0,
-            "Voice profile is not enrolled. Run: python enroll_voice.py",
-        )
-
-    try:
-        candidate_info = inspect_voice_recording(candidate_path)
-
-        candidate_issues = get_voice_quality_issues(
-            candidate_info,
-            minimum_speech_seconds=VOICE_COMMAND_MINIMUM_SPEECH_SECONDS,
-        )
-    except Exception as error:
-        return (
-            False,
-            0.0,
-            f"Could not inspect voice recording: {error}",
-        )
-
-    if candidate_issues:
-        return (
-            False,
-            0.0,
-            "Voice check needs a clearer recording. "
-            + " ".join(candidate_issues),
-        )
-
-    try:
-        verifier = _get_voice_verifier()
-    except Exception as error:
-        return (
-            False,
-            0.0,
-            f"Voice-verification setup could not start: {error}",
-        )
-
-    scores: list[float] = []
-
-    for profile_file in profile_files:
-        try:
-            score = _compare_voice_files(
-                verifier,
-                profile_file,
-                candidate_path,
-            )
-        except Exception as error:
-            print(
-                "[Voice comparison skipped: "
-                f"{type(error).__name__}: {error}]"
-            )
-            continue
-
-        is_match = score >= VOICE_VERIFICATION_THRESHOLD
-
-        print(
-            f"[Voice comparison: {profile_file.name} | "
-            f"score={score:.3f} | match={is_match}]"
-        )
-
-        scores.append(score)
-
-    if len(scores) < VOICE_AUTH_REQUIRED_MATCHES:
-        return (
-            False,
-            0.0,
-            "Not enough valid voice comparisons were available.",
-        )
-
-    best_scores = sorted(scores, reverse=True)[
-        :VOICE_AUTH_REQUIRED_MATCHES
-    ]
-
-    decision_score = float(statistics.mean(best_scores))
-
-    matches = sum(
-        score >= VOICE_VERIFICATION_THRESHOLD
-        for score in scores
-    )
-
-    if (
-        matches >= VOICE_AUTH_REQUIRED_MATCHES
-        and decision_score >= VOICE_VERIFICATION_THRESHOLD
-    ):
-        return (
-            True,
-            decision_score,
-            f"Voice verified with {matches} matching profile samples.",
-        )
-
-    return (
-        False,
-        decision_score,
-        f"Voice verification failed. "
-        f"Only {matches} profile samples matched.",
-    )
-
-
-def transcribe_verified_audio(audio_path: str | Path) -> str:
-    path = Path(audio_path)
-
-    if not path.is_file():
-        return ""
-
-    try:
-        model = _get_whisper_model()
-
-        segments, _info = model.transcribe(
-            str(path),
+        segments, _ = model.transcribe(
+            str(audio_path),
             language="en",
             beam_size=1,
             vad_filter=True,
             condition_on_previous_text=False,
+            temperature=0.0,
         )
 
-        return " ".join(
-            segment.text.strip()
-            for segment in segments
-        ).strip()
-
-    except Exception as error:
-        print(f"[Speech recognition error: {error}]")
-        return ""
+        return " ".join(segment.text.strip() for segment in segments).strip()
+    except Exception as exc:
+        raise VoiceAuthError(f"Offline transcription failed: {exc}") from exc
 
 
-def listen_for_verified_text(
-    duration_seconds: float,
-) -> tuple[str, bool, float, str]:
-    audio_path: Path | None = None
+def _speech_only_waveform(audio_path: Path) -> torch.Tensor:
+    samples, source_rate = sf.read(
+        str(audio_path),
+        dtype="float32",
+        always_2d=True,
+    )
+    mono = np.mean(samples, axis=1)
+
+    if len(mono) == 0:
+        raise VoiceAuthError("The audio file is empty.")
+
+    rms = float(np.sqrt(np.mean(np.square(mono))))
+    speech_floor = max(MIN_RMS, rms * 0.35)
+    speech_positions = np.flatnonzero(np.abs(mono) >= speech_floor)
+
+    if len(speech_positions) == 0:
+        raise VoiceAuthError("No usable speech was found in the audio.")
+
+    padding = int(source_rate * SILENCE_TRIM_PADDING_SECONDS)
+    start = max(0, int(speech_positions[0]) - padding)
+    end = min(len(mono), int(speech_positions[-1]) + padding + 1)
+
+    mono = mono[start:end]
+
+    waveform = torch.from_numpy(mono.copy()).to(
+        dtype=torch.float32
+    ).unsqueeze(0)
+
+    if source_rate != SAMPLE_RATE:
+        waveform = torchaudio.functional.resample(
+            waveform,
+            orig_freq=source_rate,
+            new_freq=SAMPLE_RATE,
+        )
+
+    minimum_samples = int(SAMPLE_RATE * 0.50)
+
+    if waveform.shape[1] < minimum_samples:
+        raise VoiceAuthError("The spoken part of the audio was too short.")
+
+    return waveform
+
+
+def _get_speaker_verifier() -> object:
+    global _speaker_verifier
+
+    with _speaker_verifier_lock:
+        if _speaker_verifier is None:
+            try:
+                from speechbrain.pretrained import SpeakerRecognition
+
+                print("[Loading offline voice-verification model...]")
+                VOICE_AUTH_MODEL_DIR.mkdir(parents=True, exist_ok=True)
+
+                _speaker_verifier = SpeakerRecognition.from_hparams(
+                    source=VOICE_AUTH_MODEL_SOURCE,
+                    savedir=str(VOICE_AUTH_MODEL_DIR),
+                    run_opts={"device": "cpu"},
+                )
+            except Exception as exc:
+                raise VoiceAuthError(
+                    "Voice-verification model could not load. "
+                    "Run the Phase 14 package reset commands before continuing. "
+                    f"Details: {exc}"
+                ) from exc
+
+    return _speaker_verifier
+
+
+def _embedding_from_file(audio_path: Path) -> torch.Tensor:
+    verifier = _get_speaker_verifier()
+    waveform = _speech_only_waveform(audio_path)
 
     try:
-        audio_path = _record_wav(
-            duration_seconds=duration_seconds,
-            prefix="voice_auth_command",
+        with torch.inference_mode():
+            embedding = verifier.encode_batch(waveform)
+    except Exception as exc:
+        raise VoiceAuthError(f"Speaker embedding extraction failed: {exc}") from exc
+
+    embedding = embedding.reshape(1, -1).to(dtype=torch.float32)
+
+    return F.normalize(embedding, p=2, dim=1).squeeze(0).cpu()
+
+
+def _verify_speaker_recording(audio_path: Path) -> SpeakerVerificationResult:
+    profiles = _profile_files()
+
+    if len(profiles) < VOICE_AUTH_PROFILE_SAMPLES:
+        return SpeakerVerificationResult(
+            passed=False,
+            best_score=0.0,
+            matching_samples=0,
+            required_matches=VOICE_AUTH_REQUIRED_MATCHES,
+            threshold=VOICE_AUTH_SCORE_THRESHOLD,
+            scores=(),
+            reason=(
+                "Voice profile is incomplete. "
+                "Run enroll_voice.py before using Jarvis."
+            ),
         )
 
-        is_verified, score, message = verify_voice_recording(audio_path)
+    candidate_embedding = _embedding_from_file(audio_path)
+    profile_embeddings = [_embedding_from_file(profile) for profile in profiles]
 
-        if not is_verified:
-            return "", False, score, message
-
-        text = transcribe_verified_audio(audio_path)
-
-        if not text:
-            return (
-                "",
-                True,
-                score,
-                "Voice verified, but no speech was recognized.",
-            )
-
-        return text, True, score, message
-
-    except Exception as error:
-        return (
-            "",
-            False,
-            0.0,
-            f"Voice authentication error: {error}",
-        )
-
-    finally:
-        if audio_path and audio_path.is_file():
-            try:
-                audio_path.unlink()
-            except OSError:
-                pass
-
-
-def replace_voice_profile(sample_paths: list[str | Path]) -> None:
-    samples = [Path(path) for path in sample_paths]
-
-    if len(samples) < VOICE_AUTH_PROFILE_SAMPLES:
-        raise ValueError(
-            f"At least {VOICE_AUTH_PROFILE_SAMPLES} samples are required."
-        )
-
-    for sample_path in samples:
-        if not sample_path.is_file():
-            raise FileNotFoundError(
-                f"Voice sample was not found: {sample_path}"
-            )
-
-    staging_dir = VOICE_AUTH_PROFILE_DIR.parent / (
-        f".voice_profile_staging_{uuid4().hex}"
+    scores = tuple(
+        float(torch.dot(candidate_embedding, profile_embedding).item())
+        for profile_embedding in profile_embeddings
     )
 
-    staging_dir.mkdir(parents=True, exist_ok=False)
+    required_matches = min(VOICE_AUTH_REQUIRED_MATCHES, len(scores))
+    matching_samples = sum(
+        score >= VOICE_AUTH_SCORE_THRESHOLD
+        for score in scores
+    )
+    best_score = max(scores, default=0.0)
+    passed = matching_samples >= required_matches
+
+    if passed:
+        reason = "Speaker verification passed."
+    else:
+        reason = (
+            f"Only {matching_samples} profile samples matched; "
+            f"{required_matches} are required."
+        )
+
+    return SpeakerVerificationResult(
+        passed=passed,
+        best_score=best_score,
+        matching_samples=matching_samples,
+        required_matches=required_matches,
+        threshold=VOICE_AUTH_SCORE_THRESHOLD,
+        scores=scores,
+        reason=reason,
+    )
+
+
+def _phrase_matches(challenge_phrase: str, transcript: str) -> bool:
+    expected_words = _normalise_text(challenge_phrase).split()
+    heard_words = set(_normalise_text(transcript).split())
+
+    return bool(expected_words) and all(word in heard_words for word in expected_words)
+
+
+def run_voice_liveness_check(
+    *,
+    interactive: bool,
+    speak_prompt: bool,
+    verify_speaker: bool = True,
+) -> VoiceLivenessResult:
+    challenge_phrase = _random_challenge_phrase()
+
+    recording_path = AUTH_AUDIO_DIR / (
+        f"liveness_{int(time.time() * 1000)}.wav"
+    )
+
+    print("\nJarvis Phase 14: Voice Liveness Check")
+    print(f'Say exactly: "{challenge_phrase}"')
+
+    if speak_prompt:
+        from core.text_to_speech import speak
+
+        speak(f"Security check, Boss. Please say: {challenge_phrase}")
+        time.sleep(0.35)
+
+    if interactive:
+        input("Press Enter, then speak the phrase clearly when recording begins...")
 
     try:
-        for index, sample_path in enumerate(
-            samples[:VOICE_AUTH_PROFILE_SAMPLES],
-            start=1,
-        ):
-            destination = staging_dir / f"profile_{index:02d}.wav"
+        _record_wav(recording_path, VOICE_AUTH_LIVENESS_SECONDS)
+        quality = _analyse_audio(recording_path)
 
-            shutil.copy2(sample_path, destination)
+        print(
+            "Audio quality: "
+            f"rms={quality.rms:.3f}, "
+            f"peak={quality.peak:.3f}, "
+            f"active={quality.active_ratio:.0%}"
+        )
 
-        if VOICE_AUTH_PROFILE_DIR.exists():
-            shutil.rmtree(VOICE_AUTH_PROFILE_DIR)
+        if not quality.passed:
+            return VoiceLivenessResult(
+                passed=False,
+                challenge_phrase=challenge_phrase,
+                transcript="",
+                quality=quality,
+                speaker=None,
+                reason=quality.reason,
+            )
 
-        staging_dir.replace(VOICE_AUTH_PROFILE_DIR)
+        transcript = _transcribe_audio(recording_path)
+
+        print(f"[Heard: {transcript or '(nothing)'}]")
+
+        if not _phrase_matches(challenge_phrase, transcript):
+            return VoiceLivenessResult(
+                passed=False,
+                challenge_phrase=challenge_phrase,
+                transcript=transcript,
+                quality=quality,
+                speaker=None,
+                reason="The random challenge phrase did not match.",
+            )
+
+        if not verify_speaker:
+            return VoiceLivenessResult(
+                passed=True,
+                challenge_phrase=challenge_phrase,
+                transcript=transcript,
+                quality=quality,
+                speaker=None,
+                reason="Phrase and audio-quality checks passed.",
+            )
+
+        speaker = _verify_speaker_recording(recording_path)
+
+        print(
+            "[Voice score: "
+            f"{speaker.best_score:.3f}; "
+            f"matches: {speaker.matching_samples}/{speaker.required_matches}]"
+        )
+
+        return VoiceLivenessResult(
+            passed=speaker.passed,
+            challenge_phrase=challenge_phrase,
+            transcript=transcript,
+            quality=quality,
+            speaker=speaker,
+            reason=speaker.reason,
+        )
+
+    except VoiceAuthError as exc:
+        return VoiceLivenessResult(
+            passed=False,
+            challenge_phrase=challenge_phrase,
+            transcript="",
+            quality=None,
+            speaker=None,
+            reason=str(exc),
+        )
 
     finally:
-        if staging_dir.exists():
-            shutil.rmtree(staging_dir, ignore_errors=True)
+        if recording_path.exists() and not VOICE_AUTH_KEEP_DIAGNOSTIC_AUDIO:
+            recording_path.unlink(missing_ok=True)
 
 
-def delete_audio_files(audio_paths: list[str | Path]) -> None:
-    for audio_path in audio_paths:
-        try:
-            path = Path(audio_path)
+def _save_calibration(profile_scores: list[float]) -> None:
+    VOICE_AUTH_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
 
-            if path.is_file():
-                path.unlink()
+    payload = {
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "profile_count": len(_profile_files()),
+        "score_threshold": VOICE_AUTH_SCORE_THRESHOLD,
+        "required_matches": VOICE_AUTH_REQUIRED_MATCHES,
+        "profile_pair_scores": [round(score, 6) for score in profile_scores],
+        "profile_pair_median": (
+            round(float(np.median(profile_scores)), 6)
+            if profile_scores
+            else None
+        ),
+    }
 
-        except OSError:
-            pass
+    CALIBRATION_PATH.write_text(
+        json.dumps(payload, indent=2),
+        encoding="utf-8",
+    )
+
+
+def enroll_voice_profile() -> None:
+    VOICE_AUTH_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    AUTH_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+
+    for old_profile in _profile_files():
+        old_profile.unlink(missing_ok=True)
+
+    CALIBRATION_PATH.unlink(missing_ok=True)
+
+    enrollment_phrases = (
+        "Jarvis, this is my secure voice profile sample one.",
+        "Jarvis, I am recording my secure voice profile sample two.",
+        "Jarvis, only my verified voice may operate this assistant.",
+        "Jarvis, this profile helps protect my personal assistant.",
+        "Jarvis, I authorize secure access with my natural voice.",
+    )
+
+    print("\nJarvis Phase 14: Voice Profile Enrollment")
+    print(
+        "Use your normal voice and the same microphone you will use daily. "
+        "Speak clearly without music or another person nearby."
+    )
+
+    for index in range(VOICE_AUTH_PROFILE_SAMPLES):
+        phrase = enrollment_phrases[index % len(enrollment_phrases)]
+
+        destination = VOICE_AUTH_PROFILE_DIR / (
+            f"profile_{index + 1:02d}.wav"
+        )
+
+        print(f"\nSample {index + 1} of {VOICE_AUTH_PROFILE_SAMPLES}")
+        print(f'Say naturally: "{phrase}"')
+        input("Press Enter when you are ready...")
+
+        _record_wav(destination, VOICE_AUTH_ENROLLMENT_SECONDS)
+        quality = _analyse_audio(destination)
+
+        print(
+            "Audio quality: "
+            f"rms={quality.rms:.3f}, "
+            f"peak={quality.peak:.3f}, "
+            f"active={quality.active_ratio:.0%}"
+        )
+
+        if not quality.passed:
+            destination.unlink(missing_ok=True)
+
+            raise VoiceAuthError(
+                f"Enrollment stopped at sample {index + 1}: {quality.reason} "
+                "Run enroll_voice.py again."
+            )
+
+    profile_embeddings = [
+        _embedding_from_file(profile)
+        for profile in _profile_files()
+    ]
+
+    profile_scores = [
+        float(torch.dot(left, right).item())
+        for left, right in itertools.combinations(profile_embeddings, 2)
+    ]
+
+    median_score = float(np.median(profile_scores)) if profile_scores else 0.0
+
+    if median_score < VOICE_AUTH_SCORE_THRESHOLD:
+        for profile in _profile_files():
+            profile.unlink(missing_ok=True)
+
+        raise VoiceAuthError(
+            "Enrollment recordings were not consistent enough for secure "
+            f"verification (median score {median_score:.3f}; required "
+            f"{VOICE_AUTH_SCORE_THRESHOLD:.3f}). Move closer to the microphone "
+            "and run enroll_voice.py again."
+        )
+
+    _save_calibration(profile_scores)
+
+    print("\nVoice profile enrolled securely.")
+    print(
+        f"Profile consistency median: {median_score:.3f} | "
+        f"verification threshold: {VOICE_AUTH_SCORE_THRESHOLD:.3f}"
+    )
+
+
+def listen_for_verified_text(seconds: float) -> str | None:
+    if not VOICE_AUTH_ENABLED:
+        from core.speech_to_text import listen_for_text
+
+        return listen_for_text(seconds)
+
+    if not has_voice_profile():
+        from core.text_to_speech import speak
+
+        message = (
+            "Your voice profile is not enrolled. "
+            "Run python enroll_voice.py first."
+        )
+
+        print(f"[Access blocked: {message}]")
+        speak(message)
+
+        return None
+
+    result = run_voice_liveness_check(
+        interactive=False,
+        speak_prompt=True,
+        verify_speaker=True,
+    )
+
+    if not result.passed:
+        from core.text_to_speech import speak
+
+        print(f"[Access blocked: {result.reason}]")
+        speak("Access blocked. Voice verification failed.")
+
+        return None
+
+    from core.speech_to_text import listen_for_text
+    from core.text_to_speech import speak
+
+    speak("Voice verified. What can I do for you?")
+
+    return listen_for_text(seconds)
